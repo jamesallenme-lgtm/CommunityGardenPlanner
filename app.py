@@ -130,7 +130,7 @@ def render_bed(bed_number: int, editable: bool = False) -> None:
 
 
 def overview_page() -> None:
-    st.title("🌱 Community Garden Planner")
+    st.title("🌱 FBSS Hope Garden (Beta)")
     st.caption("Four raised beds · 128 square feet · sample plan")
     planted = sum(
         crop != "Empty"
