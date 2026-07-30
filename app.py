@@ -7,7 +7,7 @@ import streamlit as st
 
 
 st.set_page_config(
-    page_title="Community Garden Planner",
+    page_title="FBSS Hope Garden (Beta)",
     page_icon="🌱",
     layout="wide",
 )
