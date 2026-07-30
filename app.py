@@ -93,8 +93,11 @@ def render_bed(bed_number: int, editable: bool = False) -> None:
                     f"<div title='{square}: {crop}' style='background:{color};"
                     "border:1px solid #62705c;border-radius:6px;min-height:68px;"
                     "display:flex;flex-direction:column;align-items:center;"
-                    "justify-content:center;text-align:center;padding:4px'>"
-                    f"<strong>{square}</strong><small>{crop}</small></div>"
+                    "justify-content:center;text-align:center;padding:4px;"
+                    "overflow:hidden'>"
+                    f"<strong>{square}</strong><small style='font-size:0.72rem;"
+                    "line-height:1.05;max-width:100%;overflow-wrap:anywhere;"
+                    f"word-break:break-word'>{crop}</small></div>"
                 ),
                 unsafe_allow_html=True,
             )
@@ -144,12 +147,10 @@ def overview_page() -> None:
     st.info(
         "Each cell represents one square foot. Use **Edit Bed Maps** to change crops."
     )
-    for start in (1, 3):
-        columns = st.columns(2)
-        with columns[0]:
-            render_bed(start)
-        with columns[1]:
-            render_bed(start + 1)
+    for bed_number in range(1, 5):
+        render_bed(bed_number)
+        if bed_number < 4:
+            st.divider()
 
 
 def edit_beds_page() -> None:
