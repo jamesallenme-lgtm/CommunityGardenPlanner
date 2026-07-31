@@ -104,6 +104,34 @@ def load_google_sheet_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     )
 
 
+def connection_error_message(error: Exception) -> str:
+    """Translate nested Google/cache errors into a safe public status message."""
+    chain = []
+    current: BaseException | None = error
+    seen = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        chain.append(f"{type(current).__name__}: {current}")
+        current = current.__cause__ or current.__context__
+
+    details = " | ".join(chain).lower()
+    if "secrets" in details or "google_service_account" in details:
+        return "Streamlit Secrets are missing or incomplete"
+    if "private key" in details or "malformederror" in details:
+        return "the service-account private key is malformed"
+    if "spreadsheetnotfound" in details or "requested entity was not found" in details:
+        return "the spreadsheet ID is wrong or the Sheet was not shared with the service account"
+    if "worksheetnotfound" in details:
+        return "one or more worksheet names do not match the template"
+    if "permission" in details or "403" in details:
+        return "Google denied access; check API enablement and Sheet sharing"
+    if "invalidgrant" in details or "invalid_grant" in details:
+        return "Google rejected the service-account credentials"
+    if "quota" in details or "429" in details:
+        return "Google Sheets temporarily rate-limited the app"
+    return "the Google Sheet connection failed; check the Streamlit app logs"
+
+
 def load_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, str]:
     try:
         assignments, plantings, crop_library = load_google_sheet_data()
@@ -112,7 +140,7 @@ def load_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, str]:
         assignments = sample_assignments()
         plantings = sample_plantings()
         crop_library = sample_crop_library()
-        source = f"Sample data ({type(error).__name__})"
+        source = f"Sample data — {connection_error_message(error)}"
 
     assignments["Bed"] = pd.to_numeric(assignments["Bed"], errors="coerce").astype(
         "Int64"
