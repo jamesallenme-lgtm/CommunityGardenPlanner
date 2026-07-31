@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-import calendar
 from datetime import date, timedelta
-import html
 import logging
 from typing import Any
 
+import altair as alt
 import gspread
 import pandas as pd
 import streamlit as st
@@ -315,7 +314,7 @@ def calendar_page(
                 },
             ]
         )
-    view = st.radio("View", ["Task list", "Month calendar"], horizontal=True)
+    view = st.radio("View", ["Task list", "Gantt timeline"], horizontal=True)
     if view == "Task list":
         task_frame = pd.DataFrame(tasks, columns=["Date", "Task", "Type"])
         if not task_frame.empty:
@@ -333,163 +332,110 @@ def calendar_page(
         )
         return
 
-    render_month_calendar(records)
+    render_gantt_chart(records)
 
 
-def render_month_calendar(records: pd.DataFrame) -> None:
+def render_gantt_chart(records: pd.DataFrame) -> None:
     if records.empty:
-        st.info("Add planting records to display the calendar.")
+        st.info("Add planting records to display the timeline.")
         return
 
     bed_values = sorted(int(value) for value in records["Bed"].dropna().unique())
-    filter_column, month_column = st.columns(2)
-    selected_bed = filter_column.selectbox("Bed", ["All beds", *bed_values])
-
-    earliest = min(records["Plant Date"].min(), date.today())
-    latest = max(
-        records["Expected Harvest"].max() + timedelta(days=13), date.today()
-    )
-    month_options = []
-    cursor = date(earliest.year, earliest.month, 1)
-    final_month = date(latest.year, latest.month, 1)
-    while cursor <= final_month:
-        month_options.append(cursor)
-        cursor = (
-            date(cursor.year + 1, 1, 1)
-            if cursor.month == 12
-            else date(cursor.year, cursor.month + 1, 1)
-        )
-    current_month = date.today().replace(day=1)
-    default_index = (
-        month_options.index(current_month)
-        if current_month in month_options
-        else len(month_options) - 1
-    )
-    selected_month = month_column.selectbox(
-        "Month",
-        month_options,
-        index=default_index,
-        format_func=lambda value: value.strftime("%B %Y"),
-    )
+    selected_bed = st.selectbox("Bed", ["All beds", *bed_values])
 
     filtered = records
     if selected_bed != "All beds":
         filtered = records[records["Bed"] == selected_bed]
 
-    phase_colors = {
-        "Germination": "#5B8FF9",
-        "Growth": "#61B15A",
-        "Harvest": "#E3A62F",
-    }
-    st.markdown(
-        " ".join(
-            (
-                f"<span style='display:inline-block;background:{color};color:white;"
-                "border-radius:10px;padding:3px 9px;margin-right:8px;font-size:.82rem'>"
-                f"{phase}</span>"
-            )
-            for phase, color in phase_colors.items()
-        ),
-        unsafe_allow_html=True,
-    )
-    st.caption(
-        "Germination runs through the expected germination date; growth continues until harvest; the harvest window is shown for 14 days."
-    )
-
-    event_days: dict[date, list[dict[str, str]]] = {}
-    for _, row in filtered.iterrows():
-        start = row["Plant Date"]
-        germination = row["Germination Date"]
-        harvest = row["Expected Harvest"]
-        end = harvest + timedelta(days=13)
-        current = start
-        while current <= end:
-            if current <= germination:
-                phase = "Germination"
-            elif current < harvest:
-                phase = "Growth"
-            else:
-                phase = "Harvest"
-            bed_label = (
-                f"B{int(row['Bed'])} · " if selected_bed == "All beds" else ""
-            )
-            event_days.setdefault(current, []).append(
+    phase_rows = []
+    for index, row in filtered.reset_index(drop=True).iterrows():
+        planting_label = (
+            f"Bed {int(row['Bed'])} · {row['Crop']} · {row['Squares']}"
+        )
+        if pd.notna(row.get("Variety")) and str(row.get("Variety")).strip():
+            planting_label += f" · {row['Variety']}"
+        germination_end = row["Germination Date"] + timedelta(days=1)
+        harvest_start = row["Expected Harvest"]
+        phase_rows.extend(
+            [
                 {
-                    "phase": phase,
-                    "label": f"{bed_label}{row['Crop']}",
-                    "title": (
-                        f"Bed {int(row['Bed'])}: {row['Crop']} "
-                        f"({row['Squares']}) — {phase}"
-                    ),
-                }
-            )
-            current += timedelta(days=1)
+                    "Planting": planting_label,
+                    "Order": index,
+                    "Phase": "Germination",
+                    "Start": row["Plant Date"],
+                    "End": germination_end,
+                },
+                {
+                    "Planting": planting_label,
+                    "Order": index,
+                    "Phase": "Growth",
+                    "Start": germination_end,
+                    "End": harvest_start,
+                },
+                {
+                    "Planting": planting_label,
+                    "Order": index,
+                    "Phase": "Harvest",
+                    "Start": harvest_start,
+                    "End": harvest_start + timedelta(days=14),
+                },
+            ]
+        )
 
-    weeks = calendar.Calendar(firstweekday=6).monthdatescalendar(
-        selected_month.year, selected_month.month
+    gantt_data = pd.DataFrame(phase_rows)
+    gantt_data["Start"] = pd.to_datetime(gantt_data["Start"])
+    gantt_data["End"] = pd.to_datetime(gantt_data["End"])
+    phase_order = ["Germination", "Growth", "Harvest"]
+    phase_range = ["#5B8FF9", "#61B15A", "#E3A62F"]
+
+    bars = (
+        alt.Chart(gantt_data)
+        .mark_bar(cornerRadius=3, height=18)
+        .encode(
+            x=alt.X(
+                "Start:T",
+                title="Date",
+                axis=alt.Axis(format="%b %d", labelAngle=-35, grid=True),
+            ),
+            x2="End:T",
+            y=alt.Y(
+                "Planting:N",
+                title=None,
+                sort=alt.SortField(field="Order", order="ascending"),
+                axis=alt.Axis(labelLimit=330),
+            ),
+            color=alt.Color(
+                "Phase:N",
+                scale=alt.Scale(domain=phase_order, range=phase_range),
+                legend=alt.Legend(title="Period", orient="top"),
+            ),
+            tooltip=[
+                alt.Tooltip("Planting:N"),
+                alt.Tooltip("Phase:N"),
+                alt.Tooltip("Start:T", format="%b %d, %Y"),
+                alt.Tooltip("End:T", format="%b %d, %Y"),
+            ],
+        )
     )
-    weekday_headers = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
-    cells = [
-        f"<div class='garden-weekday'>{weekday}</div>"
-        for weekday in weekday_headers
-    ]
-    for week in weeks:
-        for day_value in week:
-            classes = "garden-day"
-            if day_value.month != selected_month.month:
-                classes += " garden-day-muted"
-            if day_value == date.today():
-                classes += " garden-day-today"
-            entries = event_days.get(day_value, [])
-            badges = []
-            for entry in entries[:4]:
-                badges.append(
-                    (
-                        f"<div class='garden-event' title='{html.escape(entry['title'])}' "
-                        f"style='background:{phase_colors[entry['phase']]};'>"
-                        f"{html.escape(entry['label'])}</div>"
-                    )
-                )
-            if len(entries) > 4:
-                badges.append(
-                    f"<div class='garden-more'>+{len(entries) - 4} more</div>"
-                )
-            cells.append(
-                (
-                    f"<div class='{classes}'><div class='garden-date'>"
-                    f"{day_value.day}</div>{''.join(badges)}</div>"
-                )
-            )
-
-    calendar_html = f"""
-    <style>
-      .garden-calendar-wrap {{ overflow-x:auto; margin-top:.7rem; }}
-      .garden-calendar {{
-        display:grid; grid-template-columns:repeat(7,minmax(95px,1fr));
-        gap:4px; min-width:700px;
-      }}
-      .garden-weekday {{
-        text-align:center; font-weight:700; color:#44513f; padding:7px 2px;
-      }}
-      .garden-day {{
-        min-height:122px; border:1px solid #ccd6c8; border-radius:6px;
-        background:#fff; padding:5px; overflow:hidden;
-      }}
-      .garden-day-muted {{ background:#f3f4f2; color:#9ba39a; }}
-      .garden-day-today {{ border:2px solid #315c3b; }}
-      .garden-date {{ font-weight:700; margin-bottom:4px; }}
-      .garden-event {{
-        color:#fff; border-radius:4px; font-size:.72rem; line-height:1.15;
-        margin:3px 0; padding:3px 4px; white-space:nowrap;
-        overflow:hidden; text-overflow:ellipsis;
-      }}
-      .garden-more {{ font-size:.7rem; color:#657063; margin-top:3px; }}
-    </style>
-    <div class="garden-calendar-wrap">
-      <div class="garden-calendar">{''.join(cells)}</div>
-    </div>
-    """
-    st.markdown(calendar_html, unsafe_allow_html=True)
+    today_rule = (
+        alt.Chart(pd.DataFrame({"Today": [pd.Timestamp(date.today())]}))
+        .mark_rule(color="#B23A48", strokeWidth=2, strokeDash=[5, 4])
+        .encode(
+            x="Today:T",
+            tooltip=[alt.Tooltip("Today:T", title="Today", format="%b %d, %Y")],
+        )
+    )
+    chart_height = max(260, 48 * len(filtered))
+    chart = (
+        (bars + today_rule)
+        .properties(height=chart_height)
+        .configure_view(stroke=None)
+        .configure_axis(labelFontSize=11, titleFontSize=12)
+    )
+    st.altair_chart(chart, width="stretch")
+    st.caption(
+        "The dashed red line marks today. Harvest is displayed as a 14-day planning window."
+    )
 
 
 def crop_library_page(crop_library: pd.DataFrame) -> None:
