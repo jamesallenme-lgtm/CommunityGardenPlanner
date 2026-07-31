@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import calendar
 from datetime import date, timedelta
+import html
 import logging
 from typing import Any
 
@@ -100,7 +102,12 @@ def connection_error_message(error: Exception) -> str:
     details = " | ".join(chain).lower()
     if "secrets" in details or "google_service_account" in details:
         return "Streamlit Secrets are missing or incomplete"
-    if "private key" in details or "malformederror" in details:
+    if (
+        "private key" in details
+        or "malformederror" in details
+        or "unable to load pem" in details
+        or "invalidheader" in details
+    ):
         return "the service-account private key is malformed"
     if "spreadsheetnotfound" in details or "requested entity was not found" in details:
         return "the spreadsheet ID is wrong or the Sheet was not shared with the service account"
@@ -308,18 +315,181 @@ def calendar_page(
                 },
             ]
         )
-    task_frame = pd.DataFrame(tasks, columns=["Date", "Task", "Type"])
-    if not task_frame.empty:
-        task_frame = task_frame.sort_values("Date").reset_index(drop=True)
-    filter_choice = st.radio("Show", ["Upcoming", "All tasks"], horizontal=True)
-    if filter_choice == "Upcoming":
-        task_frame = task_frame[task_frame["Date"] >= date.today()]
-    st.dataframe(
-        task_frame,
-        hide_index=True,
-        width="stretch",
-        column_config={"Date": st.column_config.DateColumn(format="ddd, MMM D, YYYY")},
+    view = st.radio("View", ["Task list", "Month calendar"], horizontal=True)
+    if view == "Task list":
+        task_frame = pd.DataFrame(tasks, columns=["Date", "Task", "Type"])
+        if not task_frame.empty:
+            task_frame = task_frame.sort_values("Date").reset_index(drop=True)
+        filter_choice = st.radio("Show", ["Upcoming", "All tasks"], horizontal=True)
+        if filter_choice == "Upcoming":
+            task_frame = task_frame[task_frame["Date"] >= date.today()]
+        st.dataframe(
+            task_frame,
+            hide_index=True,
+            width="stretch",
+            column_config={
+                "Date": st.column_config.DateColumn(format="ddd, MMM D, YYYY")
+            },
+        )
+        return
+
+    render_month_calendar(records)
+
+
+def render_month_calendar(records: pd.DataFrame) -> None:
+    if records.empty:
+        st.info("Add planting records to display the calendar.")
+        return
+
+    bed_values = sorted(int(value) for value in records["Bed"].dropna().unique())
+    filter_column, month_column = st.columns(2)
+    selected_bed = filter_column.selectbox("Bed", ["All beds", *bed_values])
+
+    earliest = min(records["Plant Date"].min(), date.today())
+    latest = max(
+        records["Expected Harvest"].max() + timedelta(days=13), date.today()
     )
+    month_options = []
+    cursor = date(earliest.year, earliest.month, 1)
+    final_month = date(latest.year, latest.month, 1)
+    while cursor <= final_month:
+        month_options.append(cursor)
+        cursor = (
+            date(cursor.year + 1, 1, 1)
+            if cursor.month == 12
+            else date(cursor.year, cursor.month + 1, 1)
+        )
+    current_month = date.today().replace(day=1)
+    default_index = (
+        month_options.index(current_month)
+        if current_month in month_options
+        else len(month_options) - 1
+    )
+    selected_month = month_column.selectbox(
+        "Month",
+        month_options,
+        index=default_index,
+        format_func=lambda value: value.strftime("%B %Y"),
+    )
+
+    filtered = records
+    if selected_bed != "All beds":
+        filtered = records[records["Bed"] == selected_bed]
+
+    phase_colors = {
+        "Germination": "#5B8FF9",
+        "Growth": "#61B15A",
+        "Harvest": "#E3A62F",
+    }
+    st.markdown(
+        " ".join(
+            (
+                f"<span style='display:inline-block;background:{color};color:white;"
+                "border-radius:10px;padding:3px 9px;margin-right:8px;font-size:.82rem'>"
+                f"{phase}</span>"
+            )
+            for phase, color in phase_colors.items()
+        ),
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        "Germination runs through the expected germination date; growth continues until harvest; the harvest window is shown for 14 days."
+    )
+
+    event_days: dict[date, list[dict[str, str]]] = {}
+    for _, row in filtered.iterrows():
+        start = row["Plant Date"]
+        germination = row["Germination Date"]
+        harvest = row["Expected Harvest"]
+        end = harvest + timedelta(days=13)
+        current = start
+        while current <= end:
+            if current <= germination:
+                phase = "Germination"
+            elif current < harvest:
+                phase = "Growth"
+            else:
+                phase = "Harvest"
+            bed_label = (
+                f"B{int(row['Bed'])} · " if selected_bed == "All beds" else ""
+            )
+            event_days.setdefault(current, []).append(
+                {
+                    "phase": phase,
+                    "label": f"{bed_label}{row['Crop']}",
+                    "title": (
+                        f"Bed {int(row['Bed'])}: {row['Crop']} "
+                        f"({row['Squares']}) — {phase}"
+                    ),
+                }
+            )
+            current += timedelta(days=1)
+
+    weeks = calendar.Calendar(firstweekday=6).monthdatescalendar(
+        selected_month.year, selected_month.month
+    )
+    weekday_headers = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+    cells = [
+        f"<div class='garden-weekday'>{weekday}</div>"
+        for weekday in weekday_headers
+    ]
+    for week in weeks:
+        for day_value in week:
+            classes = "garden-day"
+            if day_value.month != selected_month.month:
+                classes += " garden-day-muted"
+            if day_value == date.today():
+                classes += " garden-day-today"
+            entries = event_days.get(day_value, [])
+            badges = []
+            for entry in entries[:4]:
+                badges.append(
+                    (
+                        f"<div class='garden-event' title='{html.escape(entry['title'])}' "
+                        f"style='background:{phase_colors[entry['phase']]};'>"
+                        f"{html.escape(entry['label'])}</div>"
+                    )
+                )
+            if len(entries) > 4:
+                badges.append(
+                    f"<div class='garden-more'>+{len(entries) - 4} more</div>"
+                )
+            cells.append(
+                (
+                    f"<div class='{classes}'><div class='garden-date'>"
+                    f"{day_value.day}</div>{''.join(badges)}</div>"
+                )
+            )
+
+    calendar_html = f"""
+    <style>
+      .garden-calendar-wrap {{ overflow-x:auto; margin-top:.7rem; }}
+      .garden-calendar {{
+        display:grid; grid-template-columns:repeat(7,minmax(95px,1fr));
+        gap:4px; min-width:700px;
+      }}
+      .garden-weekday {{
+        text-align:center; font-weight:700; color:#44513f; padding:7px 2px;
+      }}
+      .garden-day {{
+        min-height:122px; border:1px solid #ccd6c8; border-radius:6px;
+        background:#fff; padding:5px; overflow:hidden;
+      }}
+      .garden-day-muted {{ background:#f3f4f2; color:#9ba39a; }}
+      .garden-day-today {{ border:2px solid #315c3b; }}
+      .garden-date {{ font-weight:700; margin-bottom:4px; }}
+      .garden-event {{
+        color:#fff; border-radius:4px; font-size:.72rem; line-height:1.15;
+        margin:3px 0; padding:3px 4px; white-space:nowrap;
+        overflow:hidden; text-overflow:ellipsis;
+      }}
+      .garden-more {{ font-size:.7rem; color:#657063; margin-top:3px; }}
+    </style>
+    <div class="garden-calendar-wrap">
+      <div class="garden-calendar">{''.join(cells)}</div>
+    </div>
+    """
+    st.markdown(calendar_html, unsafe_allow_html=True)
 
 
 def crop_library_page(crop_library: pd.DataFrame) -> None:
