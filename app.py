@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, timedelta
+import logging
 from typing import Any
 
 import gspread
@@ -14,6 +15,8 @@ st.set_page_config(
     page_icon="🌱",
     layout="wide",
 )
+
+LOGGER = logging.getLogger("community_garden")
 
 DEFAULT_CROPS = {
     "Empty": {"color": "#F4F1E8", "germination": 0, "harvest": 0},
@@ -84,26 +87,6 @@ def _worksheet_frame(spreadsheet: Any, worksheet_name: str) -> pd.DataFrame:
     return pd.DataFrame(records)
 
 
-@st.cache_data(ttl=60, show_spinner="Loading the latest garden plan…")
-def load_google_sheet_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    service_account = dict(st.secrets["google_service_account"])
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets.readonly",
-        "https://www.googleapis.com/auth/drive.readonly",
-    ]
-    credentials = Credentials.from_service_account_info(
-        service_account, scopes=scopes
-    )
-    client = gspread.authorize(credentials)
-    spreadsheet_id = st.secrets["google_sheet"]["spreadsheet_id"]
-    spreadsheet = client.open_by_key(spreadsheet_id)
-    return (
-        _worksheet_frame(spreadsheet, "Bed Assignments"),
-        _worksheet_frame(spreadsheet, "Plantings"),
-        _worksheet_frame(spreadsheet, "Crop Library"),
-    )
-
-
 def connection_error_message(error: Exception) -> str:
     """Translate nested Google/cache errors into a safe public status message."""
     chain = []
@@ -132,15 +115,47 @@ def connection_error_message(error: Exception) -> str:
     return "the Google Sheet connection failed; check the Streamlit app logs"
 
 
-def load_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, str]:
+@st.cache_data(ttl=60, show_spinner="Loading the latest garden plan…")
+def load_google_sheet_data() -> tuple[
+    pd.DataFrame | None,
+    pd.DataFrame | None,
+    pd.DataFrame | None,
+    str | None,
+]:
     try:
-        assignments, plantings, crop_library = load_google_sheet_data()
-        source = "Live Google Sheet"
+        service_account = dict(st.secrets["google_service_account"])
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets.readonly",
+            "https://www.googleapis.com/auth/drive.readonly",
+        ]
+        credentials = Credentials.from_service_account_info(
+            service_account, scopes=scopes
+        )
+        client = gspread.authorize(credentials)
+        spreadsheet_id = st.secrets["google_sheet"]["spreadsheet_id"]
+        spreadsheet = client.open_by_key(spreadsheet_id)
+        return (
+            _worksheet_frame(spreadsheet, "Bed Assignments"),
+            _worksheet_frame(spreadsheet, "Plantings"),
+            _worksheet_frame(spreadsheet, "Crop Library"),
+            None,
+        )
     except Exception as error:
+        LOGGER.exception("Google Sheets data load failed")
+        return None, None, None, connection_error_message(error)
+
+
+def load_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, str]:
+    assignments, plantings, crop_library, connection_error = (
+        load_google_sheet_data()
+    )
+    if connection_error is None:
+        source = "Live Google Sheet"
+    else:
         assignments = sample_assignments()
         plantings = sample_plantings()
         crop_library = sample_crop_library()
-        source = f"Sample data — {connection_error_message(error)}"
+        source = f"Sample data — {connection_error}"
 
     assignments["Bed"] = pd.to_numeric(assignments["Bed"], errors="coerce").astype(
         "Int64"
