@@ -1,18 +1,21 @@
 from __future__ import annotations
 
 from datetime import date, timedelta
+from typing import Any
 
+import gspread
 import pandas as pd
 import streamlit as st
+from google.oauth2.service_account import Credentials
 
 
 st.set_page_config(
-    page_title="FBSS Hope Garden (Beta)",
+    page_title="Community Garden Planner",
     page_icon="🌱",
     layout="wide",
 )
 
-CROPS = {
+DEFAULT_CROPS = {
     "Empty": {"color": "#F4F1E8", "germination": 0, "harvest": 0},
     "Beans": {"color": "#83C57A", "germination": 7, "harvest": 55},
     "Carrots": {"color": "#F4A261", "germination": 10, "harvest": 70},
@@ -28,17 +31,20 @@ def square_ids() -> list[str]:
     return [f"{row}{column}" for row in "ABCD" for column in range(1, 9)]
 
 
-def sample_beds() -> dict[int, dict[str, str]]:
+def sample_assignments() -> pd.DataFrame:
     patterns = {
         1: ["Carrots"] * 8 + ["Beans"] * 8 + ["Collards"] * 8 + ["Okra"] * 8,
         2: ["Tomatoes"] * 8 + ["Lettuce"] * 16 + ["Peppers"] * 8,
         3: ["Beans"] * 16 + ["Carrots"] * 16,
         4: ["Collards"] * 16 + ["Empty"] * 16,
     }
-    return {
-        bed: dict(zip(square_ids(), crops, strict=True))
-        for bed, crops in patterns.items()
-    }
+    rows = []
+    for bed, crops in patterns.items():
+        rows.extend(
+            {"Bed": bed, "Square": square, "Crop": crop}
+            for square, crop in zip(square_ids(), crops, strict=True)
+        )
+    return pd.DataFrame(rows)
 
 
 def sample_plantings() -> pd.DataFrame:
@@ -56,38 +62,127 @@ def sample_plantings() -> pd.DataFrame:
     )
 
 
-def calculate_dates(frame: pd.DataFrame) -> pd.DataFrame:
-    result = frame.copy()
-    result["Plant Date"] = pd.to_datetime(result["Plant Date"]).dt.date
+def sample_crop_library() -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "Crop": crop,
+                "Germination Days": details["germination"],
+                "Harvest Days": details["harvest"],
+                "Color": details["color"],
+            }
+            for crop, details in DEFAULT_CROPS.items()
+            if crop != "Empty"
+        ]
+    )
+
+
+def _worksheet_frame(spreadsheet: Any, worksheet_name: str) -> pd.DataFrame:
+    records = spreadsheet.worksheet(worksheet_name).get_all_records()
+    if not records:
+        raise ValueError(f"The '{worksheet_name}' worksheet is empty.")
+    return pd.DataFrame(records)
+
+
+@st.cache_data(ttl=60, show_spinner="Loading the latest garden plan…")
+def load_google_sheet_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    service_account = dict(st.secrets["google_service_account"])
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets.readonly",
+        "https://www.googleapis.com/auth/drive.readonly",
+    ]
+    credentials = Credentials.from_service_account_info(
+        service_account, scopes=scopes
+    )
+    client = gspread.authorize(credentials)
+    spreadsheet_id = st.secrets["google_sheet"]["spreadsheet_id"]
+    spreadsheet = client.open_by_key(spreadsheet_id)
+    return (
+        _worksheet_frame(spreadsheet, "Bed Assignments"),
+        _worksheet_frame(spreadsheet, "Plantings"),
+        _worksheet_frame(spreadsheet, "Crop Library"),
+    )
+
+
+def load_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, str]:
+    try:
+        assignments, plantings, crop_library = load_google_sheet_data()
+        source = "Live Google Sheet"
+    except Exception as error:
+        assignments = sample_assignments()
+        plantings = sample_plantings()
+        crop_library = sample_crop_library()
+        source = f"Sample data ({type(error).__name__})"
+
+    assignments["Bed"] = pd.to_numeric(assignments["Bed"], errors="coerce").astype(
+        "Int64"
+    )
+    plantings["Bed"] = pd.to_numeric(plantings["Bed"], errors="coerce").astype(
+        "Int64"
+    )
+    plantings["Plant Date"] = pd.to_datetime(
+        plantings["Plant Date"], errors="coerce"
+    ).dt.date
+    crop_library["Germination Days"] = pd.to_numeric(
+        crop_library["Germination Days"], errors="coerce"
+    ).fillna(0)
+    crop_library["Harvest Days"] = pd.to_numeric(
+        crop_library["Harvest Days"], errors="coerce"
+    ).fillna(0)
+    return assignments, plantings, crop_library, source
+
+
+def crop_settings(crop_library: pd.DataFrame) -> dict[str, dict[str, Any]]:
+    settings = {"Empty": DEFAULT_CROPS["Empty"].copy()}
+    for _, row in crop_library.iterrows():
+        crop = str(row["Crop"]).strip()
+        settings[crop] = {
+            "color": str(row.get("Color") or "#D9E3D5"),
+            "germination": int(row["Germination Days"]),
+            "harvest": int(row["Harvest Days"]),
+        }
+    return settings
+
+
+def calculate_dates(
+    plantings: pd.DataFrame, crops: dict[str, dict[str, Any]]
+) -> pd.DataFrame:
+    result = plantings.dropna(subset=["Plant Date"]).copy()
     result["Germination Date"] = result.apply(
         lambda row: row["Plant Date"]
-        + timedelta(days=CROPS.get(row["Crop"], CROPS["Empty"])["germination"]),
+        + timedelta(days=crops.get(str(row["Crop"]), crops["Empty"])["germination"]),
         axis=1,
     )
     result["Expected Harvest"] = result.apply(
         lambda row: row["Plant Date"]
-        + timedelta(days=CROPS.get(row["Crop"], CROPS["Empty"])["harvest"]),
+        + timedelta(days=crops.get(str(row["Crop"]), crops["Empty"])["harvest"]),
         axis=1,
     )
     return result
 
 
-def initialize_state() -> None:
-    if "beds" not in st.session_state:
-        st.session_state.beds = sample_beds()
-    if "plantings" not in st.session_state:
-        st.session_state.plantings = sample_plantings()
+def bed_map(assignments: pd.DataFrame, bed_number: int) -> dict[str, str]:
+    bed_rows = assignments[assignments["Bed"] == bed_number]
+    values = {
+        str(row["Square"]).strip().upper(): str(row["Crop"]).strip()
+        for _, row in bed_rows.iterrows()
+    }
+    return {square: values.get(square, "Empty") for square in square_ids()}
 
 
-def render_bed(bed_number: int, editable: bool = False) -> None:
-    bed = st.session_state.beds[bed_number]
+def render_bed(
+    assignments: pd.DataFrame,
+    crops: dict[str, dict[str, Any]],
+    bed_number: int,
+) -> None:
+    bed = bed_map(assignments, bed_number)
     st.markdown(f"#### Bed {bed_number} · 4 ft × 8 ft")
     for row in "ABCD":
         columns = st.columns(8, gap="small")
         for index, column_number in enumerate(range(1, 9)):
             square = f"{row}{column_number}"
             crop = bed[square]
-            color = CROPS[crop]["color"]
+            color = crops.get(crop, {"color": "#D9E3D5"})["color"]
             columns[index].markdown(
                 (
                     f"<div title='{square}: {crop}' style='background:{color};"
@@ -101,107 +196,57 @@ def render_bed(bed_number: int, editable: bool = False) -> None:
                 ),
                 unsafe_allow_html=True,
             )
-    if editable:
-        with st.expander(f"Edit Bed {bed_number} assignments"):
-            edit_frame = pd.DataFrame(
-                [
-                    {"Square": square, "Crop": crop}
-                    for square, crop in bed.items()
-                ]
-            )
-            edited = st.data_editor(
-                edit_frame,
-                hide_index=True,
-                width="stretch",
-                disabled=["Square"],
-                column_config={
-                    "Crop": st.column_config.SelectboxColumn(
-                        "Crop", options=list(CROPS), required=True
-                    )
-                },
-                key=f"bed_editor_{bed_number}",
-            )
-            if st.button("Save assignments", key=f"save_bed_{bed_number}"):
-                st.session_state.beds[bed_number] = dict(
-                    zip(edited["Square"], edited["Crop"], strict=True)
-                )
-                st.success(f"Bed {bed_number} updated.")
-                st.rerun()
 
 
-def overview_page() -> None:
-    st.title("🌱 FBSS Hope Garden (Beta)")
-    st.caption("Four raised beds · 128 square feet · sample plan")
-    planted = sum(
-        crop != "Empty"
-        for bed in st.session_state.beds.values()
-        for crop in bed.values()
+def overview_page(
+    assignments: pd.DataFrame,
+    plantings: pd.DataFrame,
+    crops: dict[str, dict[str, Any]],
+) -> None:
+    st.title("🌱 Community Garden Planner")
+    st.caption("Four raised beds · 128 square feet · read-only public view")
+    planted = int((assignments["Crop"].astype(str) != "Empty").sum())
+    schedule = calculate_dates(plantings, crops)
+    upcoming = schedule[schedule["Expected Harvest"] >= date.today()]
+    next_harvest = (
+        upcoming["Expected Harvest"].min().strftime("%b %d")
+        if not upcoming.empty
+        else "None scheduled"
     )
     left, middle, right = st.columns(3)
     left.metric("Beds", 4)
     middle.metric("Planted squares", f"{planted} / 128")
-    next_harvest = calculate_dates(st.session_state.plantings)[
-        "Expected Harvest"
-    ].min()
-    right.metric("Next expected harvest", next_harvest.strftime("%b %d"))
-    st.info(
-        "Each cell represents one square foot. Use **Edit Bed Maps** to change crops."
-    )
+    right.metric("Next expected harvest", next_harvest)
+    st.info("Garden coordinators update the private Google Sheet. This page is view-only.")
     for bed_number in range(1, 5):
-        render_bed(bed_number)
+        render_bed(assignments, crops, bed_number)
         if bed_number < 4:
             st.divider()
 
 
-def edit_beds_page() -> None:
-    st.title("Edit Bed Maps")
-    st.write(
-        "Choose a crop for any square, save the bed, and the visual map updates immediately."
-    )
-    selected_bed = st.selectbox("Raised bed", [1, 2, 3, 4])
-    render_bed(selected_bed, editable=True)
-
-
-def plantings_page() -> None:
+def plantings_page(
+    plantings: pd.DataFrame, crops: dict[str, dict[str, Any]]
+) -> None:
     st.title("Planting Records")
-    st.write(
-        "Germination and harvest dates are calculated from the crop timing library."
-    )
-    edited = st.data_editor(
-        st.session_state.plantings,
-        num_rows="dynamic",
+    st.write("Germination and harvest dates use the timing values in the Google Sheet.")
+    records = calculate_dates(plantings, crops)
+    st.dataframe(
+        records,
         hide_index=True,
         width="stretch",
         column_config={
-            "Bed": st.column_config.SelectboxColumn(options=[1, 2, 3, 4], required=True),
-            "Crop": st.column_config.SelectboxColumn(
-                options=[crop for crop in CROPS if crop != "Empty"], required=True
-            ),
-            "Plant Date": st.column_config.DateColumn(required=True),
+            "Plant Date": st.column_config.DateColumn(format="MMM D, YYYY"),
+            "Germination Date": st.column_config.DateColumn(format="MMM D, YYYY"),
+            "Expected Harvest": st.column_config.DateColumn(format="MMM D, YYYY"),
         },
-        key="planting_editor",
     )
-    if st.button("Save planting records", type="primary"):
-        st.session_state.plantings = edited
-        st.success("Planting records saved.")
-        st.rerun()
-    if not edited.empty:
-        st.markdown("#### Calculated schedule")
-        st.dataframe(
-            calculate_dates(edited),
-            hide_index=True,
-            width="stretch",
-            column_config={
-                "Plant Date": st.column_config.DateColumn(format="MMM D, YYYY"),
-                "Germination Date": st.column_config.DateColumn(format="MMM D, YYYY"),
-                "Expected Harvest": st.column_config.DateColumn(format="MMM D, YYYY"),
-            },
-        )
 
 
-def calendar_page() -> None:
+def calendar_page(
+    plantings: pd.DataFrame, crops: dict[str, dict[str, Any]]
+) -> None:
     st.title("Tasks & Calendar")
-    records = calculate_dates(st.session_state.plantings)
+    records = calculate_dates(plantings, crops)
     tasks = []
     for _, row in records.iterrows():
         label = f"Bed {row['Bed']} · {row['Crop']} ({row['Squares']})"
@@ -220,10 +265,10 @@ def calendar_page() -> None:
                 },
             ]
         )
-    task_frame = pd.DataFrame(tasks).sort_values("Date").reset_index(drop=True)
-    filter_choice = st.radio(
-        "Show", ["Upcoming", "All tasks"], horizontal=True
-    )
+    task_frame = pd.DataFrame(tasks, columns=["Date", "Task", "Type"])
+    if not task_frame.empty:
+        task_frame = task_frame.sort_values("Date").reset_index(drop=True)
+    filter_choice = st.radio("Show", ["Upcoming", "All tasks"], horizontal=True)
     if filter_choice == "Upcoming":
         task_frame = task_frame[task_frame["Date"] >= date.today()]
     st.dataframe(
@@ -232,55 +277,40 @@ def calendar_page() -> None:
         width="stretch",
         column_config={"Date": st.column_config.DateColumn(format="ddd, MMM D, YYYY")},
     )
-    st.caption(
-        "This simple calendar is a chronological task list, which works well on phones."
-    )
 
 
-def crop_library_page() -> None:
+def crop_library_page(crop_library: pd.DataFrame) -> None:
     st.title("Crop Timing Library")
-    library = pd.DataFrame(
-        [
-            {
-                "Crop": crop,
-                "Germination (days)": details["germination"],
-                "Harvest (days)": details["harvest"],
-            }
-            for crop, details in CROPS.items()
-            if crop != "Empty"
-        ]
-    )
-    st.dataframe(library, hide_index=True, width="stretch")
+    st.dataframe(crop_library, hide_index=True, width="stretch")
     st.warning(
-        "Timings are demonstration defaults. Adjust them for the variety, season, and local climate."
+        "Timings are planning estimates. Adjust them in the private Sheet for the variety, season, and local climate."
     )
 
 
-initialize_state()
+assignments_data, plantings_data, crop_library_data, data_source = load_data()
+crop_data = crop_settings(crop_library_data)
+
 with st.sidebar:
     st.header("Community Garden")
     page = st.radio(
         "Go to",
-        [
-            "Garden Overview",
-            "Edit Bed Maps",
-            "Planting Records",
-            "Tasks & Calendar",
-            "Crop Library",
-        ],
+        ["Garden Overview", "Planting Records", "Tasks & Calendar", "Crop Library"],
     )
     st.divider()
-    if st.button("Reset sample data"):
-        st.session_state.beds = sample_beds()
-        st.session_state.plantings = sample_plantings()
+    if st.button("Refresh garden data"):
+        load_google_sheet_data.clear()
         st.rerun()
-    st.caption("Demo data is stored only for this browser session.")
+    if data_source == "Live Google Sheet":
+        st.success("Data source: Live Google Sheet")
+    else:
+        st.warning(f"Data source: {data_source}")
+    st.caption("Public visitors cannot edit garden data from this app.")
 
-pages = {
-    "Garden Overview": overview_page,
-    "Edit Bed Maps": edit_beds_page,
-    "Planting Records": plantings_page,
-    "Tasks & Calendar": calendar_page,
-    "Crop Library": crop_library_page,
-}
-pages[page]()
+if page == "Garden Overview":
+    overview_page(assignments_data, plantings_data, crop_data)
+elif page == "Planting Records":
+    plantings_page(plantings_data, crop_data)
+elif page == "Tasks & Calendar":
+    calendar_page(plantings_data, crop_data)
+else:
+    crop_library_page(crop_library_data)
