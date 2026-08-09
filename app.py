@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, timedelta
+import html
 import logging
 from typing import Any
 
@@ -219,32 +220,125 @@ def bed_map(assignments: pd.DataFrame, bed_number: int) -> dict[str, str]:
     return {square: values.get(square, "Empty") for square in square_ids()}
 
 
-def render_bed(
+def bed_grid_html(
     assignments: pd.DataFrame,
     crops: dict[str, dict[str, Any]],
     bed_number: int,
-) -> None:
+    compact: bool = False,
+) -> str:
     bed = bed_map(assignments, bed_number)
-    st.markdown(f"#### Bed {bed_number} · 4 ft × 8 ft")
+    cells = []
     for row in "ABCD":
-        columns = st.columns(8, gap="small")
-        for index, column_number in enumerate(range(1, 9)):
+        for column_number in range(1, 9):
             square = f"{row}{column_number}"
             crop = bed[square]
             color = crops.get(crop, {"color": "#D9E3D5"})["color"]
-            columns[index].markdown(
-                (
-                    f"<div title='{square}: {crop}' style='background:{color};"
-                    "border:1px solid #62705c;border-radius:6px;min-height:68px;"
-                    "display:flex;flex-direction:column;align-items:center;"
-                    "justify-content:center;text-align:center;padding:4px;"
-                    "overflow:hidden'>"
-                    f"<strong>{square}</strong><small style='font-size:0.72rem;"
-                    "line-height:1.05;max-width:100%;overflow-wrap:anywhere;"
-                    f"word-break:break-word'>{crop}</small></div>"
-                ),
-                unsafe_allow_html=True,
+            content = "" if compact else (
+                f"<strong>{html.escape(square)}</strong>"
+                f"<small>{html.escape(crop)}</small>"
             )
+            cells.append(
+                f"<div class='garden-cell' title='{html.escape(square)}: "
+                f"{html.escape(crop)}' style='background:{html.escape(str(color))};'>"
+                f"{content}</div>"
+            )
+    mode = "compact-grid" if compact else "bed-grid"
+    return f"<div class='{mode}'>{''.join(cells)}</div>"
+
+
+def render_responsive_garden(
+    assignments: pd.DataFrame,
+    crops: dict[str, dict[str, Any]],
+) -> None:
+    desktop_beds = []
+    compact_beds = []
+    mobile_details = []
+    for bed_number in range(1, 5):
+        desktop_beds.append(
+            f"<section class='desktop-bed'><h4>Bed {bed_number} - 4 ft x 8 ft</h4>"
+            f"{bed_grid_html(assignments, crops, bed_number)}</section>"
+        )
+        compact_beds.append(
+            f"<section class='compact-bed'><div class='compact-title'>Bed {bed_number}</div>"
+            f"{bed_grid_html(assignments, crops, bed_number, compact=True)}</section>"
+        )
+        mobile_details.append(
+            f"<details class='mobile-bed-detail'><summary>View Bed {bed_number} details</summary>"
+            f"<div class='detail-heading'>Bed {bed_number} - 4 ft x 8 ft</div>"
+            f"{bed_grid_html(assignments, crops, bed_number)}</details>"
+        )
+
+    planted_crops = sorted(
+        {
+            str(value).strip()
+            for value in assignments["Crop"].dropna()
+            if str(value).strip() and str(value).strip() != "Empty"
+        }
+    )
+    legend = "".join(
+        f"<span class='crop-legend-item'><i style='background:"
+        f"{html.escape(str(crops.get(crop, {'color': '#D9E3D5'})['color']))};'></i>"
+        f"{html.escape(crop)}</span>"
+        for crop in planted_crops
+    )
+
+    st.markdown(
+        f"""
+        <style>
+          .garden-desktop {{ display:block; }}
+          .garden-mobile {{ display:none; }}
+          .desktop-bed {{ margin:0 0 1.35rem 0; }}
+          .desktop-bed h4 {{ margin:.2rem 0 .5rem 0; }}
+          .bed-grid, .compact-grid {{
+            display:grid; grid-template-columns:repeat(8,minmax(0,1fr)); gap:4px;
+          }}
+          .garden-cell {{
+            border:1px solid #62705c; border-radius:6px; min-height:68px;
+            display:flex; flex-direction:column; align-items:center;
+            justify-content:center; text-align:center; padding:4px; overflow:hidden;
+          }}
+          .garden-cell small {{
+            font-size:.72rem; line-height:1.05; max-width:100%;
+            overflow-wrap:anywhere; word-break:break-word;
+          }}
+          .crop-legend {{ display:flex; flex-wrap:wrap; gap:6px 12px; margin:.6rem 0 1rem; }}
+          .crop-legend-item {{ display:inline-flex; align-items:center; font-size:.78rem; }}
+          .crop-legend-item i {{
+            width:12px; height:12px; border:1px solid #62705c;
+            border-radius:3px; margin-right:5px;
+          }}
+          @media (max-width:700px) {{
+            .garden-desktop {{ display:none; }}
+            .garden-mobile {{ display:block; }}
+            .mobile-plan {{
+              border-left:3px solid #a7b5a2; padding-left:10px; margin:.3rem 0 1rem;
+            }}
+            .compact-bed {{ margin:0 0 9px 0; }}
+            .compact-title {{ font-size:.8rem; font-weight:700; margin-bottom:2px; }}
+            .compact-grid {{ gap:2px; }}
+            .compact-grid .garden-cell {{
+              min-height:9px; height:9px; padding:0; border-radius:2px; border-width:1px;
+            }}
+            .mobile-bed-detail {{
+              border:1px solid #ccd6c8; border-radius:7px; margin:7px 0;
+              padding:7px 9px; background:#fafbf9;
+            }}
+            .mobile-bed-detail summary {{ cursor:pointer; font-weight:700; }}
+            .detail-heading {{ font-size:.82rem; margin:8px 0 4px; color:#52604e; }}
+            .mobile-bed-detail .bed-grid {{ gap:2px; }}
+            .mobile-bed-detail .garden-cell {{ min-height:48px; padding:2px; }}
+            .mobile-bed-detail .garden-cell small {{ font-size:.62rem; }}
+          }}
+        </style>
+        <div class="crop-legend">{legend}</div>
+        <div class="garden-desktop">{''.join(desktop_beds)}</div>
+        <div class="garden-mobile">
+          <div class="mobile-plan">{''.join(compact_beds)}</div>
+          <div class="mobile-detail-list">{''.join(mobile_details)}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def overview_page(
@@ -267,10 +361,7 @@ def overview_page(
     middle.metric("Planted squares", f"{planted} / 128")
     right.metric("Next expected harvest", next_harvest)
     st.info("Garden coordinators update the private Google Sheet. This page is view-only.")
-    for bed_number in range(1, 5):
-        render_bed(assignments, crops, bed_number)
-        if bed_number < 4:
-            st.divider()
+    render_responsive_garden(assignments, crops)
 
 
 def plantings_page(
