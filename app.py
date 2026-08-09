@@ -3,12 +3,14 @@ from __future__ import annotations
 from datetime import date, timedelta
 import html
 import logging
+import re
 from typing import Any
 
 import altair as alt
 import gspread
 import pandas as pd
 import streamlit as st
+from gspread.exceptions import WorksheetNotFound
 from google.oauth2.service_account import Credentials
 
 
@@ -32,8 +34,19 @@ DEFAULT_CROPS = {
 }
 
 
-def square_ids() -> list[str]:
-    return [f"{row}{column}" for row in "ABCD" for column in range(1, 9)]
+def square_ids(width: int = 4, length: int = 8) -> list[str]:
+    return [
+        f"{chr(65 + row)}{column}"
+        for row in range(width)
+        for column in range(1, length + 1)
+    ]
+
+
+def sample_beds() -> pd.DataFrame:
+    return pd.DataFrame(
+        [(bed, f"Bed {bed}", 4, 8, bed) for bed in range(1, 5)],
+        columns=["Bed", "Bed Name", "Width (ft)", "Length (ft)", "Display Order"],
+    )
 
 
 def sample_assignments() -> pd.DataFrame:
@@ -47,7 +60,7 @@ def sample_assignments() -> pd.DataFrame:
     for bed, crops in patterns.items():
         rows.extend(
             {"Bed": bed, "Square": square, "Crop": crop}
-            for square, crop in zip(square_ids(), crops, strict=True)
+            for square, crop in zip(square_ids(4, 8), crops, strict=True)
         )
     return pd.DataFrame(rows)
 
@@ -68,17 +81,27 @@ def sample_plantings() -> pd.DataFrame:
 
 
 def sample_crop_library() -> pd.DataFrame:
+    rows = [
+        ("Beans", "Provider", 7, 55, 14, "#83C57A"),
+        ("Beans", "Blue Lake", 8, 60, 14, "#83C57A"),
+        ("Carrots", "Danvers", 10, 70, 14, "#F4A261"),
+        ("Carrots", "Nantes", 14, 75, 14, "#F4A261"),
+        ("Collards", "Champion", 8, 60, 30, "#70A9A1"),
+        ("Lettuce", "Buttercrunch", 7, 45, 14, "#B7D77A"),
+        ("Okra", "Clemson Spineless", 7, 55, 21, "#E9C46A"),
+        ("Peppers", "California Wonder", 10, 75, 30, "#E76F51"),
+        ("Tomatoes", "Celebrity", 7, 80, 30, "#D95D5D"),
+    ]
     return pd.DataFrame(
-        [
-            {
-                "Crop": crop,
-                "Germination Days": details["germination"],
-                "Harvest Days": details["harvest"],
-                "Color": details["color"],
-            }
-            for crop, details in DEFAULT_CROPS.items()
-            if crop != "Empty"
-        ]
+        rows,
+        columns=[
+            "Crop",
+            "Variety",
+            "Germination Days",
+            "Harvest Days",
+            "Harvest Window Days",
+            "Color",
+        ],
     )
 
 
@@ -127,6 +150,8 @@ def load_google_sheet_data() -> tuple[
     pd.DataFrame | None,
     pd.DataFrame | None,
     pd.DataFrame | None,
+    pd.DataFrame | None,
+    str | None,
     str | None,
 ]:
     try:
@@ -141,57 +166,223 @@ def load_google_sheet_data() -> tuple[
         client = gspread.authorize(credentials)
         spreadsheet_id = st.secrets["google_sheet"]["spreadsheet_id"]
         spreadsheet = client.open_by_key(spreadsheet_id)
-        return (
-            _worksheet_frame(spreadsheet, "Bed Assignments"),
-            _worksheet_frame(spreadsheet, "Plantings"),
-            _worksheet_frame(spreadsheet, "Crop Library"),
-            None,
-        )
+        plantings = _worksheet_frame(spreadsheet, "Plantings")
+        try:
+            plant_library = _worksheet_frame(spreadsheet, "Plant Library")
+            try:
+                beds = _worksheet_frame(spreadsheet, "Beds")
+            except WorksheetNotFound:
+                beds = sample_beds()
+            return None, plantings, plant_library, beds, "Plantings-first", None
+        except WorksheetNotFound:
+            return (
+                _worksheet_frame(spreadsheet, "Bed Assignments"),
+                plantings,
+                _worksheet_frame(spreadsheet, "Crop Library"),
+                sample_beds(),
+                "Legacy",
+                None,
+            )
     except Exception as error:
         LOGGER.exception("Google Sheets data load failed")
-        return None, None, None, connection_error_message(error)
+        return None, None, None, None, None, connection_error_message(error)
 
 
-def load_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, str]:
-    assignments, plantings, crop_library, connection_error = (
+def expand_square_spec(
+    specification: Any, width: int = 4, length: int = 8
+) -> list[str]:
+    """Expand A1, A1:B4, and comma-separated combinations into square IDs."""
+    valid_square = re.compile(r"^([A-Z])([1-9][0-9]*)$")
+    expanded: list[str] = []
+    for raw_token in str(specification or "").upper().split(","):
+        token = raw_token.strip().replace(" ", "")
+        if not token:
+            continue
+        endpoints = token.split(":")
+        if len(endpoints) not in (1, 2):
+            raise ValueError(f"Invalid square range: {raw_token.strip()}")
+        start_match = valid_square.match(endpoints[0])
+        end_match = valid_square.match(endpoints[-1])
+        if not start_match or not end_match:
+            raise ValueError(f"Invalid square range: {raw_token.strip()}")
+        start_row, start_column = start_match.group(1), int(start_match.group(2))
+        end_row, end_column = end_match.group(1), int(end_match.group(2))
+        if (
+            ord(start_row) - 64 > width
+            or ord(end_row) - 64 > width
+            or start_column > length
+            or end_column > length
+        ):
+            raise ValueError(
+                f"Square range is outside this {width} ft × {length} ft bed: "
+                f"{raw_token.strip()}"
+            )
+        row_start, row_end = sorted((ord(start_row), ord(end_row)))
+        column_start, column_end = sorted((start_column, end_column))
+        expanded.extend(
+            f"{chr(row)}{column}"
+            for row in range(row_start, row_end + 1)
+            for column in range(column_start, column_end + 1)
+        )
+    return list(dict.fromkeys(expanded))
+
+
+def assignments_from_plantings(
+    plantings: pd.DataFrame, beds: pd.DataFrame
+) -> pd.DataFrame:
+    """Derive today's bed occupancy; newer active plantings win overlaps."""
+    today = date.today()
+    active = plantings.dropna(subset=["Bed", "Plant Date"]).copy()
+    active = active[
+        active["Plant Date"].apply(
+            lambda value: pd.notna(value) and pd.Timestamp(value).date() <= today
+        )
+    ]
+    if "Clear Date" in active.columns:
+        active = active[
+            active["Clear Date"].apply(
+                lambda value: pd.isna(value) or pd.Timestamp(value).date() > today
+            )
+        ]
+    active = active.assign(
+        _sort_date=pd.to_datetime(active["Plant Date"], errors="coerce")
+    ).sort_values("_sort_date")
+    occupied: dict[tuple[int, str], str] = {}
+    bed_sizes = {
+        int(row["Bed"]): (int(row["Width (ft)"]), int(row["Length (ft)"]))
+        for _, row in beds.iterrows()
+    }
+    for _, row in active.iterrows():
+        bed_number = int(row["Bed"])
+        if bed_number not in bed_sizes:
+            LOGGER.warning("Skipping planting for undefined Bed %s", bed_number)
+            continue
+        try:
+            squares = expand_square_spec(row.get("Squares"), *bed_sizes[bed_number])
+        except ValueError as error:
+            LOGGER.warning("Skipping planting with %s", error)
+            continue
+        crop = str(row.get("Crop", "")).strip()
+        if not crop:
+            continue
+        for square in squares:
+            occupied[(bed_number, square)] = crop
+    return pd.DataFrame(
+        [
+            {"Bed": bed, "Square": square, "Crop": crop}
+            for (bed, square), crop in occupied.items()
+        ],
+        columns=["Bed", "Square", "Crop"],
+    )
+
+
+def normalize_beds(beds: pd.DataFrame) -> pd.DataFrame:
+    """Validate and order spreadsheet-defined beds."""
+    aliases = {"Name": "Bed Name", "Width": "Width (ft)", "Length": "Length (ft)"}
+    beds = beds.rename(columns={key: value for key, value in aliases.items() if key in beds})
+    required = {"Bed", "Width (ft)", "Length (ft)"}
+    if not required.issubset(beds.columns):
+        raise ValueError("Beds must include Bed, Width (ft), and Length (ft) columns.")
+    if "Bed Name" not in beds.columns:
+        beds["Bed Name"] = ""
+    if "Display Order" not in beds.columns:
+        beds["Display Order"] = range(1, len(beds) + 1)
+    for column in ["Bed", "Width (ft)", "Length (ft)", "Display Order"]:
+        beds[column] = pd.to_numeric(beds[column], errors="coerce")
+    beds = beds.dropna(subset=["Bed", "Width (ft)", "Length (ft)"]).copy()
+    beds = beds[
+        beds["Bed"].between(1, 999)
+        & beds["Width (ft)"].between(1, 26)
+        & beds["Length (ft)"].between(1, 50)
+    ]
+    if beds.empty:
+        raise ValueError("The Beds worksheet does not contain a valid bed.")
+    beds[["Bed", "Width (ft)", "Length (ft)"]] = beds[
+        ["Bed", "Width (ft)", "Length (ft)"]
+    ].astype(int)
+    beds["Display Order"] = beds["Display Order"].fillna(beds["Bed"]).astype(int)
+    beds["Bed Name"] = beds.apply(
+        lambda row: str(row["Bed Name"]).strip() or f"Bed {int(row['Bed'])}", axis=1
+    )
+    return beds.drop_duplicates("Bed", keep="last").sort_values(
+        ["Display Order", "Bed"]
+    )
+
+
+def load_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, str, str]:
+    assignments, plantings, crop_library, beds, schema, connection_error = (
         load_google_sheet_data()
     )
     if connection_error is None:
-        source = "Live Google Sheet"
+        source = f"Live Google Sheet · {schema}"
     else:
         assignments = sample_assignments()
         plantings = sample_plantings()
         crop_library = sample_crop_library()
+        beds = sample_beds()
+        schema = "Sample"
         source = f"Sample data — {connection_error}"
 
-    assignments["Bed"] = pd.to_numeric(assignments["Bed"], errors="coerce").astype(
-        "Int64"
-    )
+    if "Plant" in plantings.columns and "Crop" not in plantings.columns:
+        plantings = plantings.rename(columns={"Plant": "Crop"})
+    if "Plant" in crop_library.columns and "Crop" not in crop_library.columns:
+        crop_library = crop_library.rename(columns={"Plant": "Crop"})
     plantings["Bed"] = pd.to_numeric(plantings["Bed"], errors="coerce").astype(
         "Int64"
     )
     plantings["Plant Date"] = pd.to_datetime(
         plantings["Plant Date"], errors="coerce"
     ).dt.date
+    if "Clear Date" in plantings.columns:
+        plantings["Clear Date"] = pd.to_datetime(
+            plantings["Clear Date"], errors="coerce"
+        ).dt.date
+    plantings = plantings.dropna(subset=["Bed", "Plant Date"])
     crop_library["Germination Days"] = pd.to_numeric(
         crop_library["Germination Days"], errors="coerce"
     ).fillna(0)
     crop_library["Harvest Days"] = pd.to_numeric(
         crop_library["Harvest Days"], errors="coerce"
     ).fillna(0)
-    return assignments, plantings, crop_library, source
+    if "Harvest Window Days" not in crop_library.columns:
+        crop_library["Harvest Window Days"] = 14
+    crop_library["Harvest Window Days"] = pd.to_numeric(
+        crop_library["Harvest Window Days"], errors="coerce"
+    ).fillna(14)
+    beds = normalize_beds(beds)
+    if schema == "Plantings-first":
+        assignments = assignments_from_plantings(plantings, beds)
+    assignments["Bed"] = pd.to_numeric(assignments["Bed"], errors="coerce").astype(
+        "Int64"
+    )
+    return assignments, plantings, crop_library, beds, source, str(schema)
 
 
 def crop_settings(crop_library: pd.DataFrame) -> dict[str, dict[str, Any]]:
     settings = {"Empty": DEFAULT_CROPS["Empty"].copy()}
     for _, row in crop_library.iterrows():
         crop = str(row["Crop"]).strip()
-        settings[crop] = {
+        variety = str(row.get("Variety", "")).strip()
+        details = {
             "color": str(row.get("Color") or "#D9E3D5"),
             "germination": int(row["Germination Days"]),
             "harvest": int(row["Harvest Days"]),
+            "harvest_window": int(row.get("Harvest Window Days", 14)),
         }
+        settings[f"{crop}\x1f{variety}"] = details
+        settings.setdefault(crop, details)
     return settings
+
+
+def planting_timing(
+    crops: dict[str, dict[str, Any]], crop: Any, variety: Any = ""
+) -> dict[str, Any]:
+    crop_name = str(crop).strip()
+    variety_name = str(variety or "").strip()
+    return crops.get(
+        f"{crop_name}\x1f{variety_name}",
+        crops.get(crop_name, crops["Empty"]),
+    )
 
 
 def calculate_dates(
@@ -200,36 +391,58 @@ def calculate_dates(
     result = plantings.dropna(subset=["Plant Date"]).copy()
     result["Germination Date"] = result.apply(
         lambda row: row["Plant Date"]
-        + timedelta(days=crops.get(str(row["Crop"]), crops["Empty"])["germination"]),
+        + timedelta(
+            days=planting_timing(crops, row["Crop"], row.get("Variety"))["germination"]
+        ),
         axis=1,
     )
     result["Expected Harvest"] = result.apply(
         lambda row: row["Plant Date"]
-        + timedelta(days=crops.get(str(row["Crop"]), crops["Empty"])["harvest"]),
+        + timedelta(
+            days=planting_timing(crops, row["Crop"], row.get("Variety"))["harvest"]
+        ),
+        axis=1,
+    )
+    result["Harvest Window Days"] = result.apply(
+        lambda row: planting_timing(crops, row["Crop"], row.get("Variety")).get(
+            "harvest_window", 14
+        ),
+        axis=1,
+    )
+    result["Harvest Window End"] = result.apply(
+        lambda row: row["Expected Harvest"]
+        + timedelta(days=int(row["Harvest Window Days"])),
         axis=1,
     )
     return result
 
 
-def bed_map(assignments: pd.DataFrame, bed_number: int) -> dict[str, str]:
+def bed_map(
+    assignments: pd.DataFrame, bed_number: int, width: int, length: int
+) -> dict[str, str]:
     bed_rows = assignments[assignments["Bed"] == bed_number]
     values = {
         str(row["Square"]).strip().upper(): str(row["Crop"]).strip()
         for _, row in bed_rows.iterrows()
     }
-    return {square: values.get(square, "Empty") for square in square_ids()}
+    return {
+        square: values.get(square, "Empty") for square in square_ids(width, length)
+    }
 
 
 def bed_grid_html(
     assignments: pd.DataFrame,
     crops: dict[str, dict[str, Any]],
     bed_number: int,
+    width: int,
+    length: int,
     compact: bool = False,
 ) -> str:
-    bed = bed_map(assignments, bed_number)
+    bed = bed_map(assignments, bed_number, width, length)
     cells = []
-    for row in "ABCD":
-        for column_number in range(1, 9):
+    for row_number in range(width):
+        row = chr(65 + row_number)
+        for column_number in range(1, length + 1):
             square = f"{row}{column_number}"
             crop = bed[square]
             color = crops.get(crop, {"color": "#D9E3D5"})["color"]
@@ -243,29 +456,38 @@ def bed_grid_html(
                 f"{content}</div>"
             )
     mode = "compact-grid" if compact else "bed-grid"
-    return f"<div class='{mode}'>{''.join(cells)}</div>"
+    return (
+        f"<div class='{mode}' style='grid-template-columns:repeat({length},minmax(0,1fr));'>"
+        f"{''.join(cells)}</div>"
+    )
 
 
 def render_responsive_garden(
     assignments: pd.DataFrame,
     crops: dict[str, dict[str, Any]],
+    beds: pd.DataFrame,
 ) -> None:
     desktop_beds = []
     compact_beds = []
     mobile_details = []
-    for bed_number in range(1, 5):
+    for _, bed_row in beds.iterrows():
+        bed_number = int(bed_row["Bed"])
+        bed_name = html.escape(str(bed_row["Bed Name"]))
+        width = int(bed_row["Width (ft)"])
+        length = int(bed_row["Length (ft)"])
+        dimensions = f"{width} ft x {length} ft"
         desktop_beds.append(
-            f"<section class='desktop-bed'><h4>Bed {bed_number} - 4 ft x 8 ft</h4>"
-            f"{bed_grid_html(assignments, crops, bed_number)}</section>"
+            f"<section class='desktop-bed'><h4>{bed_name} - {dimensions}</h4>"
+            f"{bed_grid_html(assignments, crops, bed_number, width, length)}</section>"
         )
         compact_beds.append(
-            f"<section class='compact-bed'><div class='compact-title'>Bed {bed_number}</div>"
-            f"{bed_grid_html(assignments, crops, bed_number, compact=True)}</section>"
+            f"<section class='compact-bed'><div class='compact-title'>{bed_name}</div>"
+            f"{bed_grid_html(assignments, crops, bed_number, width, length, compact=True)}</section>"
         )
         mobile_details.append(
-            f"<details class='mobile-bed-detail'><summary>View Bed {bed_number} details</summary>"
-            f"<div class='detail-heading'>Bed {bed_number} - 4 ft x 8 ft</div>"
-            f"{bed_grid_html(assignments, crops, bed_number)}</details>"
+            f"<details class='mobile-bed-detail'><summary>View {bed_name} details</summary>"
+            f"<div class='detail-heading'>{bed_name} - {dimensions}</div>"
+            f"{bed_grid_html(assignments, crops, bed_number, width, length)}</details>"
         )
 
     planted_crops = sorted(
@@ -290,7 +512,7 @@ def render_responsive_garden(
           .desktop-bed {{ margin:0 0 1.35rem 0; }}
           .desktop-bed h4 {{ margin:.2rem 0 .5rem 0; }}
           .bed-grid, .compact-grid {{
-            display:grid; grid-template-columns:repeat(8,minmax(0,1fr)); gap:4px;
+            display:grid; gap:4px;
           }}
           .garden-cell {{
             border:1px solid #62705c; border-radius:6px; min-height:68px;
@@ -321,7 +543,7 @@ def render_responsive_garden(
             }}
             .mobile-bed-detail {{
               border:1px solid #ccd6c8; border-radius:7px; margin:7px 0;
-              padding:7px 9px; background:#3D9DF333;
+              padding:7px 9px; background:#999999;
             }}
             .mobile-bed-detail summary {{ cursor:pointer; font-weight:700; }}
             .detail-heading {{ font-size:.82rem; margin:8px 0 4px; color:#52604e; }}
@@ -345,9 +567,11 @@ def overview_page(
     assignments: pd.DataFrame,
     plantings: pd.DataFrame,
     crops: dict[str, dict[str, Any]],
+    beds: pd.DataFrame,
 ) -> None:
     st.title("🌱 Community Garden Planner")
-    st.caption("Four raised beds · 128 square feet · read-only public view")
+    capacity = int((beds["Width (ft)"] * beds["Length (ft)"]).sum())
+    st.caption(f"{len(beds)} raised beds · {capacity} square feet · read-only public view")
     planted = int((assignments["Crop"].astype(str) != "Empty").sum())
     schedule = calculate_dates(plantings, crops)
     upcoming = schedule[schedule["Expected Harvest"] >= date.today()]
@@ -357,11 +581,11 @@ def overview_page(
         else "None scheduled"
     )
     left, middle, right = st.columns(3)
-    left.metric("Beds", 4)
-    middle.metric("Planted squares", f"{planted} / 128")
+    left.metric("Beds", len(beds))
+    middle.metric("Planted squares", f"{planted} / {capacity}")
     right.metric("Next expected harvest", next_harvest)
     st.info("Garden coordinators update the private Google Sheet. This page is view-only.")
-    render_responsive_garden(assignments, crops)
+    render_responsive_garden(assignments, crops, beds)
 
 
 def plantings_page(
@@ -468,7 +692,8 @@ def render_gantt_chart(records: pd.DataFrame) -> None:
                     "Order": index,
                     "Phase": "Harvest",
                     "Start": harvest_start,
-                    "End": harvest_start + timedelta(days=14),
+                    "End": harvest_start
+                    + timedelta(days=int(row.get("Harvest Window Days", 14))),
                 },
             ]
         )
@@ -525,42 +750,49 @@ def render_gantt_chart(records: pd.DataFrame) -> None:
     )
     st.altair_chart(chart, width="stretch")
     st.caption(
-        "The dashed red line marks today. Harvest is displayed as a 14-day planning window."
+        "The dashed red line marks today. Harvest-window length comes from the plant and variety library."
     )
 
 
-def crop_library_page(crop_library: pd.DataFrame) -> None:
-    st.title("Crop Timing Library")
-    st.dataframe(crop_library, hide_index=True, width="stretch")
+def crop_library_page(crop_library: pd.DataFrame, schema: str) -> None:
+    title = "Plant & Variety Library" if schema == "Plantings-first" else "Crop Timing Library"
+    st.title(title)
+    display_library = crop_library
+    if schema == "Plantings-first":
+        display_library = crop_library.rename(columns={"Crop": "Plant"})
+    st.dataframe(display_library, hide_index=True, width="stretch")
     st.warning(
         "Timings are planning estimates. Adjust them in the private Sheet for the variety, season, and local climate."
     )
 
 
-assignments_data, plantings_data, crop_library_data, data_source = load_data()
+assignments_data, plantings_data, crop_library_data, beds_data, data_source, sheet_schema = load_data()
 crop_data = crop_settings(crop_library_data)
+library_page_label = (
+    "Plant Library" if sheet_schema == "Plantings-first" else "Crop Library"
+)
 
 with st.sidebar:
     st.header("Community Garden")
     page = st.radio(
         "Go to",
-        ["Garden Overview", "Planting Records", "Tasks & Calendar", "Crop Library"],
+        ["Garden Overview", "Planting Records", "Tasks & Calendar", library_page_label],
     )
     st.divider()
     if st.button("Refresh garden data"):
         load_google_sheet_data.clear()
         st.rerun()
-    if data_source == "Live Google Sheet":
-        st.success("Data source: Live Google Sheet")
+    if data_source.startswith("Live Google Sheet"):
+        st.success(f"Data source: {data_source}")
     else:
         st.warning(f"Data source: {data_source}")
     st.caption("Public visitors cannot edit garden data from this app.")
 
 if page == "Garden Overview":
-    overview_page(assignments_data, plantings_data, crop_data)
+    overview_page(assignments_data, plantings_data, crop_data, beds_data)
 elif page == "Planting Records":
     plantings_page(plantings_data, crop_data)
 elif page == "Tasks & Calendar":
     calendar_page(plantings_data, crop_data)
 else:
-    crop_library_page(crop_library_data)
+    crop_library_page(crop_library_data, sheet_schema)
