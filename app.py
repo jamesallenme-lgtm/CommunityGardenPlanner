@@ -321,7 +321,7 @@ def render_responsive_garden(
             }}
             .mobile-bed-detail {{
               border:1px solid #ccd6c8; border-radius:7px; margin:7px 0;
-              padding:7px 9px; background:#999999;
+              padding:7px 9px; background:#3D9DF333;
             }}
             .mobile-bed-detail summary {{ cursor:pointer; font-weight:700; }}
             .detail-heading {{ font-size:.82rem; margin:8px 0 4px; color:#52604e; }}
