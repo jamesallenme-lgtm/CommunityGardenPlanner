@@ -27,7 +27,7 @@ st.set_page_config(
 LOGGER = logging.getLogger("community_garden")
 
 DEFAULT_CROPS = {
-    "Empty": {"color": "#F4F1E8", "germination": 0, "harvest": 0},
+    "Empty": {"color": "#92908b", "germination": 0, "harvest": 0},
     "Beans": {"color": "#83C57A", "germination": 7, "harvest": 55},
     "Carrots": {"color": "#F4A261", "germination": 10, "harvest": 70},
     "Collards": {"color": "#70A9A1", "germination": 8, "harvest": 60},
@@ -575,7 +575,7 @@ def render_responsive_garden(
             }}
             .mobile-bed-detail {{
               border:1px solid #ccd6c8; border-radius:7px; margin:7px 0;
-              padding:7px 9px; background:#999999;
+              padding:7px 9px; background:#3D9DF333;
             }}
             .mobile-bed-detail summary {{ cursor:pointer; font-weight:700; }}
             .detail-heading {{ font-size:.82rem; margin:8px 0 4px; color:#52604e; }}
