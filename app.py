@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import date, timedelta
 import html
 import logging
+from pathlib import Path
 import re
 from typing import Any
 
@@ -14,9 +15,12 @@ from gspread.exceptions import WorksheetNotFound
 from google.oauth2.service_account import Credentials
 
 
+DEFAULT_APP_TITLE = "Community Garden Planner"
+APP_ICON = Path(__file__).resolve().parent / "assets" / "garden-icon.png"
+
 st.set_page_config(
-    page_title="Community Garden Planner",
-    page_icon="🌱",
+    page_title=DEFAULT_APP_TITLE,
+    page_icon=str(APP_ICON),
     layout="wide",
 )
 
@@ -153,6 +157,7 @@ def load_google_sheet_data() -> tuple[
     pd.DataFrame | None,
     str | None,
     str | None,
+    str,
 ]:
     try:
         service_account = dict(st.secrets["google_service_account"])
@@ -166,6 +171,7 @@ def load_google_sheet_data() -> tuple[
         client = gspread.authorize(credentials)
         spreadsheet_id = st.secrets["google_sheet"]["spreadsheet_id"]
         spreadsheet = client.open_by_key(spreadsheet_id)
+        app_title = str(spreadsheet.title or "").strip() or DEFAULT_APP_TITLE
         plantings = _worksheet_frame(spreadsheet, "Plantings")
         try:
             plant_library = _worksheet_frame(spreadsheet, "Plant Library")
@@ -173,7 +179,15 @@ def load_google_sheet_data() -> tuple[
                 beds = _worksheet_frame(spreadsheet, "Beds")
             except WorksheetNotFound:
                 beds = sample_beds()
-            return None, plantings, plant_library, beds, "Plantings-first", None
+            return (
+                None,
+                plantings,
+                plant_library,
+                beds,
+                "Plantings-first",
+                None,
+                app_title,
+            )
         except WorksheetNotFound:
             return (
                 _worksheet_frame(spreadsheet, "Bed Assignments"),
@@ -182,10 +196,19 @@ def load_google_sheet_data() -> tuple[
                 sample_beds(),
                 "Legacy",
                 None,
+                app_title,
             )
     except Exception as error:
         LOGGER.exception("Google Sheets data load failed")
-        return None, None, None, None, None, connection_error_message(error)
+        return (
+            None,
+            None,
+            None,
+            None,
+            None,
+            connection_error_message(error),
+            DEFAULT_APP_TITLE,
+        )
 
 
 def expand_square_spec(
@@ -309,8 +332,16 @@ def normalize_beds(beds: pd.DataFrame) -> pd.DataFrame:
     )
 
 
-def load_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, str, str]:
-    assignments, plantings, crop_library, beds, schema, connection_error = (
+def load_data() -> tuple[
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.DataFrame,
+    str,
+    str,
+    str,
+]:
+    assignments, plantings, crop_library, beds, schema, connection_error, app_title = (
         load_google_sheet_data()
     )
     if connection_error is None:
@@ -322,6 +353,7 @@ def load_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame,
         beds = sample_beds()
         schema = "Sample"
         source = f"Sample data — {connection_error}"
+        app_title = DEFAULT_APP_TITLE
 
     if "Plant" in plantings.columns and "Crop" not in plantings.columns:
         plantings = plantings.rename(columns={"Plant": "Crop"})
@@ -355,7 +387,7 @@ def load_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame,
     assignments["Bed"] = pd.to_numeric(assignments["Bed"], errors="coerce").astype(
         "Int64"
     )
-    return assignments, plantings, crop_library, beds, source, str(schema)
+    return assignments, plantings, crop_library, beds, source, str(schema), app_title
 
 
 def crop_settings(crop_library: pd.DataFrame) -> dict[str, dict[str, Any]]:
@@ -568,8 +600,9 @@ def overview_page(
     plantings: pd.DataFrame,
     crops: dict[str, dict[str, Any]],
     beds: pd.DataFrame,
+    app_title: str,
 ) -> None:
-    st.title("🌱 Community Garden Planner")
+    st.title(app_title)
     capacity = int((beds["Width (ft)"] * beds["Length (ft)"]).sum())
     st.caption(f"{len(beds)} raised beds · {capacity} square feet · read-only public view")
     planted = int((assignments["Crop"].astype(str) != "Empty").sum())
@@ -766,14 +799,23 @@ def crop_library_page(crop_library: pd.DataFrame, schema: str) -> None:
     )
 
 
-assignments_data, plantings_data, crop_library_data, beds_data, data_source, sheet_schema = load_data()
+(
+    assignments_data,
+    plantings_data,
+    crop_library_data,
+    beds_data,
+    data_source,
+    sheet_schema,
+    app_title,
+) = load_data()
+st.set_page_config(page_title=app_title, page_icon=str(APP_ICON))
 crop_data = crop_settings(crop_library_data)
 library_page_label = (
     "Plant Library" if sheet_schema == "Plantings-first" else "Crop Library"
 )
 
 with st.sidebar:
-    st.header("Community Garden")
+    st.header(app_title)
     page = st.radio(
         "Go to",
         ["Garden Overview", "Planting Records", "Tasks & Calendar", library_page_label],
@@ -789,7 +831,7 @@ with st.sidebar:
     st.caption("Public visitors cannot edit garden data from this app.")
 
 if page == "Garden Overview":
-    overview_page(assignments_data, plantings_data, crop_data, beds_data)
+    overview_page(assignments_data, plantings_data, crop_data, beds_data, app_title)
 elif page == "Planting Records":
     plantings_page(plantings_data, crop_data)
 elif page == "Tasks & Calendar":
