@@ -1,24 +1,55 @@
-[README.md](https://github.com/user-attachments/files/30571655/README.md)
 # Community Garden Planner
 
 A public, read-only Streamlit dashboard backed by a private Google Sheet.
 
 The app includes:
 
-- Four 4 ft × 8 ft raised beds shown as 32 one-square-foot cells each
+- Spreadsheet-defined raised beds shown as one-square-foot grids
+- Responsive garden maps: full-size beds on desktop and a compact vertical site plan with expandable bed details on mobile
 - Planting records with calculated germination and harvest dates
-- A chronological task/calendar view
+- A chronological task list and bed-filtered Gantt timeline
+- Color-coded germination, growth, and 14-day harvest periods
 - A crop timing library
 - Automatic refresh from Google Sheets every 60 seconds
 
 Garden coordinators edit the private Google Sheet. Public visitors can view the
 dashboard but cannot change shared data from Streamlit.
 
+## Plantings-first migration
+
+The app name shown on the overview page, in the sidebar, and in the browser tab
+comes from the Google Sheets document name. Rename the spreadsheet in Google
+Drive to change the app title; no code or worksheet change is required. When the
+app is using sample data, it falls back to `Community Garden Planner`.
+
+The app supports both spreadsheet structures during migration:
+
+- **Plantings-first:** `Beds`, `Plantings`, `Plant Library`, `Grid Reference`, and `Instructions`
+- **Legacy:** `Bed Assignments`, `Plantings`, and `Crop Library`
+
+When `Plant Library` exists, the app automatically switches to Plantings-first
+mode. It derives today's bed maps from active Plantings rows, uses both Plant and
+Variety for timing, honors Clear Date, and uses each variety's Harvest Window
+Days in the Gantt chart. The `Beds` tab controls bed numbers, names, dimensions,
+display order, total capacity, and the shape of every grid in the app.
+
+Recommended cutover:
+
+1. Import `community-garden-plantings-first-v3.xlsx` as a new Google Sheet.
+2. Share the new Sheet with the existing service-account email as a Viewer.
+3. Confirm the Plantings and Plant Library data.
+4. Copy the new spreadsheet ID.
+5. Replace only `google_sheet.spreadsheet_id` in Streamlit Secrets.
+6. Reboot the app and confirm the sidebar says
+   **Live Google Sheet · Plantings-first**.
+
+To roll back, restore the previous spreadsheet ID. No code rollback is needed.
+
 ## Files
 
 - `app.py` — the Streamlit application
 - `requirements.txt` — Python dependencies
-- `community-garden-data-template.xlsx` — starter workbook to import into Google Sheets
+- `community-garden-plantings-first-v3.xlsx` — current workbook to import into Google Sheets
 
 ## 1. Create the Google Sheet
 
@@ -102,7 +133,9 @@ client_x509_cert_url = "YOUR_CLIENT_X509_CERT_URL"
 ```
 
 The easiest way to avoid transcription mistakes is to copy each value directly
-from the JSON file. Preserve the `\n` sequences in `private_key`.
+from the JSON file. The `private_key` value must include the complete
+`-----BEGIN PRIVATE KEY-----` header, encoded key body, and
+`-----END PRIVATE KEY-----` footer. Preserve the `\n` sequences between them.
 
 4. Save the secrets.
 5. Reboot the Streamlit app.
@@ -127,11 +160,18 @@ Cloud normally redeploys automatically.
 
 ## Editing the garden
 
-- Edit square assignments on `Bed Assignments`.
-- Add or update planting records on `Plantings`.
-- Adjust crop timing and display colors on `Crop Library`.
+- Add or resize beds on `Beds`. Width creates lettered rows (A, B, C…) and
+  Length creates numbered columns (1, 2, 3…). Width supports 1–26 feet and
+  Length supports 1–50 feet.
+- Add or update planting records on `Plantings`; its Bed dropdown comes from
+  the `Beds` tab.
+- Adjust variety-specific timing and display colors on `Plant Library`.
 - Use **Refresh garden data** in Streamlit to reload immediately, or wait up to
   60 seconds for the cache to refresh.
+
+For example, adding Bed 5 with Width 3 and Length 12 makes the app display a
+3×12 square-foot grid and accept square references from A1 through C12. No code
+change is required.
 
 ## Local development
 
